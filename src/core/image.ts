@@ -36,7 +36,7 @@ export async function downloadImage(
   reuseImage: boolean,
   onProgress: (p: FlashProgress) => void
 ): Promise<string> {
-  const imgDest = path.join(os.tmpdir(), "lva-os-test.img");
+  const imgDest = path.join(os.tmpdir(), "lva-os.img");
 
   // Skip download if --reuse-image flag is set and file exists
   if (reuseImage && fs.existsSync(imgDest)) {
@@ -44,7 +44,18 @@ export async function downloadImage(
     onProgress({ type: "download", percentage: 100 });
     return imgDest;
   }
-
+  
+  if (fs.existsSync(imgDest)) {
+    try {
+      fs.unlinkSync(imgDest);
+    } catch (e) {
+      throw new Error(
+        `Could not overwrite cached image at ${imgDest}: ${(e as Error).message}. ` +
+          `If a previous run used sudo, remove it manually or rerun with sudo.`
+      );
+    }
+  }
+  
   const res = await axios.get<NodeJS.ReadableStream>(url, {
     responseType: "stream",
     timeout: 0,
