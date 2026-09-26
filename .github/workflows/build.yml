@@ -1,9 +1,8 @@
 name: Build and Release lva-installer
 
 on:
-  push:
-    tags:
-      - "v*.*.*"
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -51,12 +50,11 @@ jobs:
           path: bin/*.zip
           if-no-files-found: error
 
-      - name: Create GitHub Release with artifacts
+      - name: Upload artifacts to the published GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             bin/*.tar.gz
             bin/*.zip
-          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
