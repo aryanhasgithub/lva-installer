@@ -23,7 +23,7 @@ import { promisify } from "util";
 import {
   mkdir, copyFile, rm, chmod, cp,
 } from "fs/promises";
-import { existsSync, createWriteStream } from "fs";
+import { existsSync, createWriteStream, createReadStream } from "fs";
 import { get } from "https";
 import path from "path";
 import os from "os";
@@ -265,7 +265,7 @@ if (!existsSync(cachedNode)) {
         .on("finish", resolve)
         .on("error", reject)
         .on("pipe", () => {});
-      require("fs").createReadStream(archivePath)
+      createReadStream(archivePath)
         .pipe(unzipper.ParseOne(new RegExp(inner.replace(/[/\\]/g, "[/\\\\]"))))
         .pipe(createWriteStream(cachedNode))
         .on("finish", resolve)
