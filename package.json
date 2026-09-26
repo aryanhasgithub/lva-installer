@@ -18,11 +18,16 @@
     "chalk": "^5.0.0",
     "drivelist": "^12.0.2",
     "xz-decompress": "^0.2.3",
-    "gpt": "^3.0.0"
+    "gpt": "^3.0.0",
+    "tar": "^7.4.3",
+    "archiver": "^7.0.1",
+    "unzipper": "^0.12.3"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/inquirer": "^9.0.0",
+    "@types/archiver": "^6.0.2",
+    "@types/unzipper": "^0.10.10",
     "tsx": "^4.0.0",
     "typescript": "^5.4.0",
     "esbuild": "^0.25.0"

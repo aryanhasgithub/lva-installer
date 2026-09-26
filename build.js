@@ -1,5 +1,14 @@
-// build.js — packages lva-installer as self-contained per-platform archives
+// build.js — packages lva-installer as a self-contained per-platform archive.
 // Stack: esbuild (bundle TS) + Go (native launcher) + official Node binary + .node addons
+//
+// Runs NATIVE per platform (via CI matrix) so that native-addon .node
+// binaries (drivelist, ext2fs, usb, etc.) are the real, correct binaries
+// for that OS/arch — never cross-compiled/copied from another platform.
+//
+// Usage:
+//   node build.js --target=linux-x86_64
+//   node build.js --target=macos-arm64
+//   node build.js                          (auto-detects current platform)
 //
 // Archive layout:
 //   lva-installer-linux-x86_64/
@@ -9,16 +18,18 @@
 //     node_modules/    ← full package dirs for native addons (node-gyp-build/bindings-style)
 
 import { build } from "esbuild";
-import { execFile, exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import {
-  mkdir, copyFile, writeFile, rm, chmod
+  mkdir, copyFile, rm, chmod, cp,
 } from "fs/promises";
 import { existsSync, createWriteStream } from "fs";
 import { get } from "https";
 import path from "path";
+import os from "os";
+import archiver from "archiver";
+import * as tar from "tar";
 
-const execAsync    = promisify(exec);
 const execFileAsync = promisify(execFile);
 
 const BUNDLE   = "dist/main.cjs";
@@ -101,6 +112,8 @@ const TARGETS = [
     goOS:    "linux",
     goArch:  "amd64",
     winExe:  false,
+    hostOS:  "linux",
+    hostArch: "x64",
   },
   {
     name:    "linux-arm64",
@@ -110,6 +123,8 @@ const TARGETS = [
     goOS:    "linux",
     goArch:  "arm64",
     winExe:  false,
+    hostOS:  "linux",
+    hostArch: "arm64",
   },
   {
     name:    "macos-x86_64",
@@ -119,6 +134,8 @@ const TARGETS = [
     goOS:    "darwin",
     goArch:  "amd64",
     winExe:  false,
+    hostOS:  "darwin",
+    hostArch: "x64",
   },
   {
     name:    "macos-arm64",
@@ -128,6 +145,8 @@ const TARGETS = [
     goOS:    "darwin",
     goArch:  "arm64",
     winExe:  false,
+    hostOS:  "darwin",
+    hostArch: "arm64",
   },
   {
     name:    "windows-x86_64",
@@ -137,13 +156,45 @@ const TARGETS = [
     goOS:    "windows",
     goArch:  "amd64",
     winExe:  true,
+    hostOS:  "win32",
+    hostArch: "x64",
   },
 ];
+
+// ─── Resolve which single target to build ─────────────────────────────────────
+
+function resolveTarget() {
+  const argFlag = process.argv.find((a) => a.startsWith("--target="));
+  const requested = argFlag ? argFlag.split("=")[1] : process.env.LVA_BUILD_TARGET;
+
+  if (requested) {
+    const found = TARGETS.find((t) => t.name === requested);
+    if (!found) {
+      throw new Error(
+        `Unknown --target="${requested}". Valid targets: ${TARGETS.map((t) => t.name).join(", ")}`
+      );
+    }
+    return found;
+  }
+
+  // Auto-detect from the current host — used for local dev builds with no
+  // --target given. CI always passes --target explicitly (one per matrix job).
+  const found = TARGETS.find((t) => t.hostOS === os.platform() && t.hostArch === os.arch());
+  if (!found) {
+    throw new Error(
+      `Could not auto-detect a target for platform=${os.platform()} arch=${os.arch()}. ` +
+      `Pass --target explicitly, e.g. --target=linux-x86_64`
+    );
+  }
+  return found;
+}
+
+const target = resolveTarget();
+console.log(`Building lva-installer for: ${target.name}\n`);
 
 await mkdir("dist",             { recursive: true });
 await mkdir("bin",              { recursive: true });
 await mkdir("dist/node-cache",  { recursive: true });
-await mkdir("dist/go-wrappers", { recursive: true });
 
 // ─── Step 1: Bundle TS + npm deps → single CJS file ──────────────────────────
 
@@ -169,121 +220,133 @@ await build({
 });
 console.log(`   → ${BUNDLE}\n`);
 
-// ─── Step 2: Compile Go wrapper for all platforms ─────────────────────────────
+// ─── Step 2: Compile Go wrapper for THIS platform only ────────────────────────
+// Running natively means we compile for the host we're already on — no
+// cross-compilation needed (and no CGO_ENABLED=0 workaround required either,
+// though we keep it since the wrapper has zero cgo dependencies anyway).
 
-console.log("2. Compiling Go launcher for all platforms...");
-for (const t of TARGETS) {
-  const outName = t.winExe ? "lva-installer.exe" : "lva-installer";
-  const outPath = path.join("dist/go-wrappers", `${t.name}-${outName}`);
-  if (!existsSync(outPath)) {
-    process.env.GOOS   = t.goOS;
-    process.env.GOARCH = t.goArch;
-    process.env.CGO_ENABLED = "0"; // pure Go, no cgo needed
-    await execFileAsync("go", [
-      "build",
-      "-ldflags=-s -w",  // strip debug info for smaller binary
-      "-o", outPath,
-      "wrapper.go",
-    ], { env: { ...process.env, GOOS: t.goOS, GOARCH: t.goArch, CGO_ENABLED: "0" } });
-    console.log(`   ✓ ${t.name}`);
+console.log(`2. Compiling Go launcher for ${target.name}...`);
+const launcherName = target.winExe ? "lva-installer.exe" : "lva-installer";
+const launcherOutPath = path.join("dist", launcherName);
+await execFileAsync("go", [
+  "build",
+  "-ldflags=-s -w",  // strip debug info for smaller binary
+  "-o", launcherOutPath,
+  "wrapper.go",
+], {
+  env: { ...process.env, GOOS: target.goOS, GOARCH: target.goArch, CGO_ENABLED: "0" },
+});
+console.log(`   ✓ ${target.name}\n`);
+
+// ─── Step 3: Fetch this platform's real Node binary ───────────────────────────
+
+console.log(`3. Fetching Node ${NODE_VER} for ${target.name}...`);
+const cachedNode = path.join("dist/node-cache", target.name + (target.winExe ? ".exe" : ""));
+
+if (!existsSync(cachedNode)) {
+  const archivePath = path.join("dist/node-cache", target.nodePkg + target.nodeExt);
+  if (!existsSync(archivePath)) {
+    console.log(`   Downloading ${target.nodePkg}${target.nodeExt}...`);
+    await downloadFile(`${BASE_URL}/${target.nodePkg}${target.nodeExt}`, archivePath);
+  }
+  console.log("   Extracting node binary...");
+  if (target.nodeExt === ".tar.gz") {
+    const inner = `${target.nodePkg}/bin/node`;
+    await tar.x({ file: archivePath, cwd: "dist/node-cache", filter: (p) => p === inner });
+    await copyFile(path.join("dist/node-cache", inner), cachedNode);
   } else {
-    console.log(`   ✓ ${t.name} (cached)`);
+    // .zip (Windows Node distribution) — use the archiver-adjacent extractor
+    // (unzipper) rather than shelling out to `unzip`, which doesn't exist on
+    // native Windows runners.
+    const { default: unzipper } = await import("unzipper");
+    const inner = `${target.nodePkg}/node.exe`;
+    await new Promise((resolve, reject) => {
+      createWriteStream(cachedNode)
+        .on("finish", resolve)
+        .on("error", reject)
+        .on("pipe", () => {});
+      require("fs").createReadStream(archivePath)
+        .pipe(unzipper.ParseOne(new RegExp(inner.replace(/[/\\]/g, "[/\\\\]"))))
+        .pipe(createWriteStream(cachedNode))
+        .on("finish", resolve)
+        .on("error", reject);
+    });
   }
 }
-console.log();
+console.log(`   ✓ ${cachedNode}\n`);
 
-// ─── Step 3: Per-platform archive ─────────────────────────────────────────────
+// ─── Step 4: Assemble staging directory ───────────────────────────────────────
 
-for (const target of TARGETS) {
-  console.log(`3. Packaging lva-installer-${target.name}...`);
+console.log(`4. Packaging lva-installer-${target.name}...`);
 
-  // Download + extract Node binary if not cached
-  const cachedNode = path.join("dist/node-cache",
-    target.name + (target.winExe ? ".exe" : ""));
+const stageName = `lva-installer-${target.name}`;
+const stageDir  = path.join("bin", stageName);
+await rm(stageDir, { recursive: true, force: true });
+await mkdir(stageDir, { recursive: true });
 
-  if (!existsSync(cachedNode)) {
-    const archivePath = path.join("dist/node-cache", target.nodePkg + target.nodeExt);
-    if (!existsSync(archivePath)) {
-      console.log(`   Downloading ${target.nodePkg}${target.nodeExt}...`);
-      await downloadFile(`${BASE_URL}/${target.nodePkg}${target.nodeExt}`, archivePath);
-    }
-    console.log(`   Extracting node binary...`);
-    if (target.nodeExt === ".tar.gz") {
-      const inner = `${target.nodePkg}/bin/node`;
-      await execAsync(`tar -xzf "${archivePath}" -C "dist/node-cache" "${inner}"`);
-      await copyFile(`dist/node-cache/${inner}`, cachedNode);
-    } else {
-      const inner = `${target.nodePkg}/node.exe`;
-      await execAsync(`unzip -o "${archivePath}" "${inner}" -d "dist/node-cache"`);
-      await copyFile(`dist/node-cache/${inner}`, cachedNode);
-    }
+// 1. Go launcher → lva-installer(.exe)
+const launcherDest = path.join(stageDir, launcherName);
+await copyFile(launcherOutPath, launcherDest);
+if (!target.winExe) await chmod(launcherDest, 0o755);
+
+// 2. Node binary
+const nodeDest = path.join(stageDir, target.nodeBin);
+await copyFile(cachedNode, nodeDest);
+if (!target.winExe) await chmod(nodeDest, 0o755);
+
+// 3. esbuild bundle
+await copyFile(BUNDLE, path.join(stageDir, "main.cjs"));
+
+// 4. Native addon packages — copy full package directories (not just .node
+// files) so runtime __dirname-relative resolution (node-gyp-build/bindings)
+// finds prebuilds/package.json/etc right where it expects them, next to
+// node_modules/<pkg>/ under the staged main.cjs. These are the REAL,
+// natively-built binaries for this platform since npm ci ran natively here.
+for (const pkg of NATIVE_PKGS) {
+  const src = path.join("node_modules", pkg);
+  if (!existsSync(src)) {
+    console.log(`   ! skipping ${pkg} (not found in node_modules)`);
+    continue;
   }
-
-  // Build staging directory
-  const stageName = `lva-installer-${target.name}`;
-  const stageDir  = path.join("bin", stageName);
-  await rm(stageDir, { recursive: true, force: true });
-  await mkdir(stageDir, { recursive: true });
-
-  // 1. Go launcher → lva-installer(.exe)
-  const launcherName = target.winExe ? "lva-installer.exe" : "lva-installer";
-  const launcherSrc  = path.join("dist/go-wrappers", `${target.name}-${launcherName}`);
-  const launcherDest = path.join(stageDir, launcherName);
-  await copyFile(launcherSrc, launcherDest);
-  if (!target.winExe) await chmod(launcherDest, 0o755);
-
-  // 2. Node binary
-  const nodeDest = path.join(stageDir, target.nodeBin);
-  await copyFile(cachedNode, nodeDest);
-  if (!target.winExe) await chmod(nodeDest, 0o755);
-
-  // 3. esbuild bundle
-  await copyFile(BUNDLE, path.join(stageDir, "main.cjs"));
-
-  // 4. Native addon packages — copy full package directories (not just .node
-  // files) so runtime __dirname-relative resolution (node-gyp-build/bindings)
-  // finds prebuilds/package.json/etc right where it expects them, next to
-  // node_modules/<pkg>/ under the staged main.cjs.
-  for (const pkg of NATIVE_PKGS) {
-    const src = path.join("node_modules", pkg);
-    if (!existsSync(src)) {
-      console.log(`   ! skipping ${pkg} (not found in node_modules)`);
-      continue;
-    }
-    const dest = path.join(stageDir, "node_modules", pkg);
-    await mkdir(path.dirname(dest), { recursive: true });
-    await execAsync(`cp -R "${src}" "${dest}"`);
-  }
-
-  // Create release archive
-  const archiveName = target.winExe
-    ? `lva-installer-${target.name}.zip`
-    : `lva-installer-${target.name}.tar.gz`;
-  const archiveOut = path.join("bin", archiveName);
-
-  if (target.winExe) {
-    await execAsync(`cd bin && zip -r "${archiveName}" "${stageName}/"`);
-  } else {
-    await execAsync(`tar -czf "${archiveOut}" -C bin "${stageName}/"`);
-  }
-
-  // Clean up staging dir
-  await rm(stageDir, { recursive: true, force: true });
-
-  console.log(`   ✓ bin/${archiveName}\n`);
+  const dest = path.join(stageDir, "node_modules", pkg);
+  await mkdir(path.dirname(dest), { recursive: true });
+  await cp(src, dest, { recursive: true });
 }
 
-console.log("Done. Release archives in ./bin/");
+// ─── Step 5: Create release archive (pure JS, no tar/zip/unzip shell-outs) ────
+
+const archiveName = target.winExe
+  ? `${stageName}.zip`
+  : `${stageName}.tar.gz`;
+const archiveOut = path.join("bin", archiveName);
+
+if (target.winExe) {
+  await createZip(stageDir, archiveOut, stageName);
+} else {
+  await tar.c(
+    { gzip: true, file: archiveOut, cwd: "bin" },
+    [stageName]
+  );
+}
+
+// Clean up staging dir
+await rm(stageDir, { recursive: true, force: true });
+
+console.log(`   ✓ ${archiveOut}\n`);
+console.log("Done.");
 console.log("\nUsage:");
-console.log("  Linux/macOS: sudo ./lva-installer-linux-x86_64/lva-installer");
-console.log("  Windows:     lva-installer-windows-x86_64\\lva-installer.exe (as Administrator)");
+if (target.winExe) {
+  console.log(`  ${stageName}\\lva-installer.exe (as Administrator)`);
+} else {
+  console.log(`  sudo ./${stageName}/lva-installer`);
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const file = createWriteStream(dest);
-    const request = (u) => get(u, res => {
+    const request = (u) => get(u, (res) => {
       if (res.statusCode === 301 || res.statusCode === 302) {
         file.close();
         return request(res.headers.location);
@@ -293,5 +356,17 @@ function downloadFile(url, dest) {
       file.on("error", reject);
     }).on("error", reject);
     request(url);
+  });
+}
+
+function createZip(sourceDir, outPath, rootName) {
+  return new Promise((resolve, reject) => {
+    const output = createWriteStream(outPath);
+    const archive = archiver("zip", { zlib: { level: 9 } });
+    output.on("close", resolve);
+    archive.on("error", reject);
+    archive.pipe(output);
+    archive.directory(sourceDir, rootName);
+    archive.finalize();
   });
 }
