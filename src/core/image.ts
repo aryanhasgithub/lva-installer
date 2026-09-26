@@ -46,15 +46,17 @@ export async function downloadImage(
   }
   
   if (fs.existsSync(imgDest)) {
-    try {
-      fs.unlinkSync(imgDest);
-    } catch (e) {
-      throw new Error(
-        `Could not overwrite cached image at ${imgDest}: ${(e as Error).message}. ` +
-          `If a previous run used sudo, remove it manually or rerun with sudo.`
-      );
-    }
+  try {
+    fs.unlinkSync(imgDest);
+  } catch (e) {
+    const err = e as Error;
+    const hint =
+      process.platform === "win32"
+        ? "Another process may have the file open (e.g. antivirus or a previous run)."
+        : "If a previous run used sudo, remove it manually or rerun with sudo.";
+    throw new Error(`Could not overwrite cached image at ${imgDest}: ${err.message}. ${hint}`);
   }
+}
   
   const res = await axios.get<NodeJS.ReadableStream>(url, {
     responseType: "stream",
